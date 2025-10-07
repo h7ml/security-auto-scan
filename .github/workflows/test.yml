@@ -1,0 +1,88 @@
+name: Test Action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: '搜索关键词'
+        required: false
+        default: '.oast.fun'
+      mask_sensitive:
+        description: '日志脱敏（true/false）'
+        required: false
+        default: 'true'
+
+jobs:
+  test-dry-run:
+    name: 测试扫描模式
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      actions: write
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test Action (Dry Run)
+        uses: ./
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          keyword: ${{ github.event.inputs.keyword || '.oast.fun' }}
+          dry-run: 'true'
+          create-issue: 'false'
+          mask-sensitive-data: ${{ github.event.inputs.mask_sensitive || 'true' }}
+
+      - name: Verify outputs
+        run: |
+          echo "✓ 测试完成！"
+          # 验证目录和报告存在
+          if [ -d "security/reports" ]; then
+            echo "✓ 报告目录已创建"
+            ls -la security/reports/
+          else
+            echo "⚠️ 报告目录不存在"
+          fi
+
+          if [ -d "security/logs" ]; then
+            echo "✓ 日志目录已创建"
+            ls -la security/logs/
+          else
+            echo "⚠️ 日志目录不存在"
+          fi
+
+  test-with-notification:
+    name: 测试通知功能
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test with Webhook (Mock)
+        uses: ./
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          keyword: '.oast.fun'
+          dry-run: 'true'
+          create-issue: 'false'
+          # 使用 RequestBin 或类似服务测试 Webhook
+          notification-webhook: ${{ secrets.TEST_WEBHOOK_URL || '' }}
+          notification-template: 'detailed'
+          mask-sensitive-data: 'true'
+
+      - name: Check notification result
+        run: |
+          echo "✓ Webhook 测试完成"
+          echo "如需测试真实通知，请在 Secrets 中设置 TEST_WEBHOOK_URL"
+

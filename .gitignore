@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Security
+.env
+.env.local
+*.pem
+*.key
+credentials.json
+
+# Logs
+*.log
+logs/
+security/logs/*.log
+security/logs/*.txt
+
+# Cache
+.alcache/
+*.cache
+
+# Temporary files
+*.tmp
+/tmp/
+temp/
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
