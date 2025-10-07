@@ -10,10 +10,24 @@ on:
         description: '发布版本标签（如 v1.0.0）'
         required: true
         type: string
+      prerelease:
+        description: '是否为预发布版本'
+        required: false
+        type: boolean
+        default: false
+      draft:
+        description: '是否创建草稿 Release'
+        required: false
+        type: boolean
+        default: false
+      generate_notes:
+        description: '自动生成 Release 说明'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
-  discussions: write
 
 jobs:
   create-release:
@@ -58,65 +72,68 @@ jobs:
       - name: 构建发布说明
         id: release_notes
         run: |
-          cat > release_notes.md <<'EOF'
-          ## 🎉 Security Auto Scan ${{ steps.version.outputs.version }}
+          VERSION="${{ steps.version.outputs.version }}"
+          PREV_TAG="${{ steps.changelog.outputs.previous_tag }}"
 
-          ### 📦 安装方式
+          {
+            echo "## 🎉 Security Auto Scan ${VERSION}"
+            echo ""
+            echo "### 📦 安装方式"
+            echo ""
+            echo "#### 方式1：从 GitHub Marketplace 安装"
+            echo ""
+            echo "访问 [GitHub Marketplace](https://github.com/marketplace/actions/security-auto-scan) 直接安装"
+            echo ""
+            echo "#### 方式2：在 workflow 中使用"
+            echo ""
+            echo '```yaml'
+            echo "- name: Security Auto Scan"
+            echo "  uses: h7ml/security-auto-scan@${VERSION}"
+            echo "  with:"
+            echo '    github-token: GITHUB_TOKEN'
+            echo "    keyword: '.oast.fun'"
+            echo "    dry-run: 'false'"
+            echo '```'
+            echo ""
+            echo "### 📝 变更内容"
+            echo ""
+          } > release_notes.md
 
-          #### 方式1：从 GitHub Marketplace 安装
-
-          访问 [GitHub Marketplace](https://github.com/marketplace/actions/security-auto-scan) 直接安装
-
-          #### 方式2：在 workflow 中使用
-
-          ```yaml
-          - name: Security Auto Scan
-            uses: h7ml/security-auto-scan@${{ steps.version.outputs.version }}
-            with:
-              github-token: ${{ secrets.GITHUB_TOKEN }}
-              keyword: '.oast.fun'
-              dry-run: 'false'
-          ```
-
-          ### 📝 变更内容
-
-          EOF
-
-          if [ -n "${{ steps.changelog.outputs.previous_tag }}" ]; then
-            echo "**完整对比**: [\`${{ steps.changelog.outputs.previous_tag }}...${{ steps.version.outputs.version }}\`](https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.previous_tag }}...${{ steps.version.outputs.version }})" >> release_notes.md
+          if [ -n "$PREV_TAG" ]; then
+            echo "**完整对比**: [\`${PREV_TAG}...${VERSION}\`](https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${VERSION})" >> release_notes.md
             echo "" >> release_notes.md
           fi
 
           cat changelog.txt >> release_notes.md
 
-          cat >> release_notes.md <<'EOF'
-
-          ### 🚀 快速开始
-
-          详细使用说明请参考：
-          - [README](https://github.com/${{ github.repository }}#readme)
-          - [使用示例](https://github.com/${{ github.repository }}/blob/main/EXAMPLES.md)
-
-          ### 📊 支持的功能
-
-          - ✅ 自动扫描所有仓库（个人 + 组织）
-          - ✅ 自动清理恶意 workflow 文件
-          - ✅ 日志脱敏（自动隐藏敏感信息）
-          - ✅ 多格式报告（Markdown/JSON/HTML/PDF）
-          - ✅ Webhook 通知（Slack/Discord/Teams）
-          - ✅ 自动创建 Issue 报警
-          - ✅ 缓存优化（性能提升 50-80%）
-
-          ### ⚠️ 重要提醒
-
-          - 使用完成后请立即撤销 Token：https://github.com/settings/tokens
-          - 建议先使用 `dry-run: true` 测试
-          - 确保 Token 拥有 `repo` 和 `workflow` 权限
-
-          ---
-
-          **完整文档**: https://github.com/${{ github.repository }}
-          EOF
+          {
+            echo ""
+            echo "### 🚀 快速开始"
+            echo ""
+            echo "详细使用说明请参考："
+            echo "- [README](https://github.com/${{ github.repository }}#readme)"
+            echo "- [使用示例](https://github.com/${{ github.repository }}/blob/main/EXAMPLES.md)"
+            echo ""
+            echo "### 📊 支持的功能"
+            echo ""
+            echo "- ✅ 自动扫描所有仓库（个人 + 组织）"
+            echo "- ✅ 自动清理恶意 workflow 文件"
+            echo "- ✅ 日志脱敏（自动隐藏敏感信息）"
+            echo "- ✅ 多格式报告（Markdown/JSON/HTML/PDF）"
+            echo "- ✅ Webhook 通知（Slack/Discord/Teams）"
+            echo "- ✅ 自动创建 Issue 报警"
+            echo "- ✅ 缓存优化（性能提升 50-80%）"
+            echo ""
+            echo "### ⚠️ 重要提醒"
+            echo ""
+            echo "- 使用完成后请立即撤销 Token：https://github.com/settings/tokens"
+            echo "- 建议先使用 \`dry-run: true\` 测试"
+            echo "- 确保 Token 拥有 \`repo\` 和 \`workflow\` 权限"
+            echo ""
+            echo "---"
+            echo ""
+            echo "**完整文档**: https://github.com/${{ github.repository }}"
+          } >> release_notes.md
 
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
@@ -124,15 +141,17 @@ jobs:
           tag_name: ${{ steps.version.outputs.version }}
           name: Release ${{ steps.version.outputs.version }}
           body_path: release_notes.md
-          draft: false
-          prerelease: false
-          generate_release_notes: false
-          discussion_category_name: Announcements
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          draft: ${{ github.event.inputs.draft || false }}
+          prerelease: ${{ github.event.inputs.prerelease || false }}
+          generate_release_notes: ${{ github.event.inputs.generate_notes || false }}
+          token: ${{ secrets.SECRETS_TOKEN }}
 
       - name: 更新 major 和 minor 标签
         run: |
+          # 配置 Git 用户信息
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           VERSION=${{ steps.version.outputs.version }}
           VERSION_NUM=${{ steps.version.outputs.version_number }}
 

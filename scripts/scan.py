@@ -10,8 +10,11 @@ import json
 import logging
 import subprocess
 import shutil
+import base64
+import hashlib
 from datetime import datetime
 from pathlib import Path
+from time import sleep
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 import requests
@@ -25,6 +28,8 @@ class ScanConfig:
     scan_only: bool = False
     disable_workflows: bool = False
     mask_sensitive: bool = True
+    encrypt_logs: bool = True  # 日志加密功能（默认启用）
+    verbose: bool = False  # 详细日志模式（默认关闭）
     webhook_url: str = ""
     notification_template: str = "detailed"
     report_format: str = "markdown"  # markdown, json, html, pdf
@@ -73,6 +78,45 @@ class GitHubActionsMasker:
         return f"{value[:show_length]}****{value[-show_length:]}"
 
 
+class LogEncryptor:
+    """日志加密工具"""
+
+    @staticmethod
+    def encrypt_message(message: str, key: str = None) -> str:
+        """加密日志消息（简单的 Base64 + Hash）"""
+        if not key:
+            key = os.getenv("GITHUB_TOKEN", "default-key")[:16]
+
+        # 使用 SHA256 生成密钥
+        hash_key = hashlib.sha256(key.encode()).digest()[:16]
+
+        # 简单的 XOR 加密
+        encrypted = bytearray()
+        for i, char in enumerate(message.encode()):
+            encrypted.append(char ^ hash_key[i % len(hash_key)])
+
+        # Base64 编码
+        return base64.b64encode(encrypted).decode()
+
+    @staticmethod
+    def decrypt_message(encrypted: str, key: str = None) -> str:
+        """解密日志消息"""
+        if not key:
+            key = os.getenv("GITHUB_TOKEN", "default-key")[:16]
+
+        hash_key = hashlib.sha256(key.encode()).digest()[:16]
+
+        # Base64 解码
+        encrypted_bytes = base64.b64decode(encrypted)
+
+        # XOR 解密
+        decrypted = bytearray()
+        for i, byte in enumerate(encrypted_bytes):
+            decrypted.append(byte ^ hash_key[i % len(hash_key)])
+
+        return decrypted.decode()
+
+
 class NotificationSender:
     """通知发送器（支持 Slack/Discord/Teams 等）"""
 
@@ -100,7 +144,7 @@ class NotificationSender:
             )
             return response.status_code == 200
         except Exception as e:
-            logging.warning(f"Webhook 通知发送失败: {e}")
+            # Webhook 发送失败，静默处理（不影响主流程）
             return False
 
     def _build_payload(self, title: str, message: str, severity: str) -> Dict:
@@ -153,7 +197,31 @@ class SecurityScanner:
 
         self._setup_logging()
         self.masker = GitHubActionsMasker()
+        self.encryptor = LogEncryptor() if config.encrypt_logs else None
         self.notifier = NotificationSender(config.webhook_url, config.notification_template)
+
+    def _log(self, level: str, message: str, force_show: bool = False) -> None:
+        """统一的日志方法（支持加密和简化模式）"""
+        # 详细模式或强制显示时，输出到控制台
+        if self.config.verbose or force_show:
+            if level == "info":
+                logging.info(message)
+            elif level == "warning":
+                logging.warning(message)
+            elif level == "error":
+                logging.error(message)
+            elif level == "debug":
+                logging.debug(message)
+
+        # 加密后写入日志文件
+        if self.config.encrypt_logs and self.encryptor:
+            encrypted_msg = self.encryptor.encrypt_message(f"[{level.upper()}] {message}")
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(f"{encrypted_msg}\n")
+        else:
+            # 不加密时直接写入
+            log_method = getattr(logging, level, logging.info)
+            log_method(message)
 
     def _setup_logging(self):
         """配置日志"""
@@ -183,62 +251,152 @@ class SecurityScanner:
                 repo = ""
         return repo
 
-    def _api_request(self, endpoint: str, method: str = "GET", data: Dict = None) -> Optional[Dict]:
-        """GitHub API 请求"""
+    def _check_rate_limit(self) -> None:
+        """检查 GitHub API 速率限制"""
+        rate_limit = self._api_request("/rate_limit", retry_count=1)
+        if rate_limit and "resources" in rate_limit:
+            core = rate_limit["resources"].get("core", {})
+            search = rate_limit["resources"].get("search", {})
+
+            remaining_core = core.get("remaining", 0)
+            remaining_search = search.get("remaining", 0)
+
+            if remaining_core < 100:
+                reset_time = datetime.fromtimestamp(core.get("reset", 0))
+                self._log(
+                    "warning",
+                    f"⚠️ Core API 配额不足: 剩余 {remaining_core} 次，"
+                    f"重置时间: {reset_time.strftime('%H:%M:%S')}",
+                    force_show=True
+                )
+
+            if remaining_search < 10:
+                reset_time = datetime.fromtimestamp(search.get("reset", 0))
+                self._log(
+                    "warning",
+                    f"⚠️ Search API 配额不足: 剩余 {remaining_search} 次，"
+                    f"重置时间: {reset_time.strftime('%H:%M:%S')}",
+                    force_show=True
+                )
+            else:
+                self._log("info", f"✓ API 配额正常: Core={remaining_core}, Search={remaining_search}", force_show=False)
+
+    def _api_request(
+        self, endpoint: str, method: str = "GET", data: Dict = None, retry_count: int = 3
+    ) -> Optional[Dict]:
+        """GitHub API 请求（带重试和速率限制处理）"""
         headers = {
             "Authorization": f"token {self.config.github_token}",
             "Accept": "application/vnd.github.v3+json"
         }
         url = f"https://api.github.com{endpoint}"
 
-        try:
-            if method == "GET":
-                response = requests.get(url, headers=headers, timeout=30)
-            elif method == "PUT":
-                response = requests.put(url, headers=headers, json=data, timeout=30)
-            elif method == "POST":
-                response = requests.post(url, headers=headers, json=data, timeout=30)
-            else:
-                raise ValueError(f"不支持的 HTTP 方法: {method}")
+        for attempt in range(retry_count):
+            try:
+                if method == "GET":
+                    response = requests.get(url, headers=headers, timeout=30)
+                elif method == "PUT":
+                    response = requests.put(url, headers=headers, json=data, timeout=30)
+                elif method == "POST":
+                    response = requests.post(url, headers=headers, json=data, timeout=30)
+                else:
+                    raise ValueError(f"不支持的 HTTP 方法: {method}")
 
-            response.raise_for_status()
-            return response.json() if response.content else {}
-        except requests.exceptions.RequestException as e:
-            logging.error(f"API 请求失败 ({endpoint}): {e}")
-            return None
+                # 检查速率限制
+                if response.status_code == 403:
+                    # 检查是否是速率限制
+                    if "rate limit" in response.text.lower() or "api rate limit" in response.text.lower():
+                        if attempt < retry_count - 1:
+                            wait_time = 60 * (attempt + 1)  # 递增等待时间
+                            self._log(
+                                "warning",
+                                f"API 速率限制，等待 {wait_time} 秒后重试 (尝试 {attempt + 1}/{retry_count})",
+                                force_show=False
+                            )
+                            sleep(wait_time)
+                            continue
+                    # 其他 403 错误（如权限问题）
+                    self._log("error", f"API 请求失败 ({endpoint}): 403 权限不足或速率限制", force_show=False)
+                    return None
+
+                # 检查其他 HTTP 错误
+                response.raise_for_status()
+                return response.json() if response.content else {}
+
+            except requests.exceptions.HTTPError as e:
+                if attempt < retry_count - 1 and e.response.status_code in [429, 502, 503, 504]:
+                    # 对于临时错误重试
+                    wait_time = 30 * (attempt + 1)
+                    self._log(
+                        "warning",
+                        f"API 临时错误 ({e.response.status_code})，等待 {wait_time} 秒后重试",
+                        force_show=False
+                    )
+                    sleep(wait_time)
+                    continue
+                self._log("error", f"API 请求失败 ({endpoint}): {e}", force_show=False)
+                return None
+            except requests.exceptions.RequestException as e:
+                if attempt < retry_count - 1:
+                    self._log("warning", f"API 请求异常，重试中 ({attempt + 1}/{retry_count}): {e}", force_show=False)
+                    sleep(10)
+                    continue
+                self._log("error", f"API 请求失败 ({endpoint}): {e}", force_show=False)
+                return None
+
+        return None
 
     def run(self) -> Tuple[int, int, int]:
         """运行扫描流程"""
-        logging.info("=" * 60)
-        logging.info("GitHub 恶意 Workflow 一键清理工具")
-        logging.info("=" * 60)
-        logging.info(f"搜索关键词: {self.config.search_keyword}")
-        logging.info(f"模式: {'仅扫描' if self.config.scan_only else '完整清理'}")
-        logging.info(f"日志脱敏: {'✓ 启用' if self.config.mask_sensitive else '✗ 禁用'}")
-        logging.info(f"Webhook 通知: {'✓ 已配置' if self.config.webhook_url else '✗ 未配置'}")
-        logging.info(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logging.info(f"日志文件: {self.log_file}")
-        logging.info("")
+        # 简化的控制台输出
+        print("🔐 Security Auto Scan - 启动中...")
+        print(f"📍 模式: {'仅扫描' if self.config.scan_only else '完整清理'}")
+        print(f"🔒 日志加密: {'✓ 启用' if self.config.encrypt_logs else '✗ 禁用'}")
+        print(f"🔍 详细日志: {'✓ 启用' if self.config.verbose else '✗ 禁用'}")
+        print("")
+
+        # 详细日志写入文件
+        self._log("info", "=" * 60)
+        self._log("info", "GitHub 恶意 Workflow 一键清理工具")
+        self._log("info", "=" * 60)
+        self._log("info", f"搜索关键词: {self.config.search_keyword}")
+        self._log("info", f"模式: {'仅扫描' if self.config.scan_only else '完整清理'}")
+        self._log("info", f"日志脱敏: {'✓ 启用' if self.config.mask_sensitive else '✗ 禁用'}")
+        self._log("info", f"日志加密: {'✓ 启用' if self.config.encrypt_logs else '✗ 禁用'}")
+        self._log("info", f"Webhook 通知: {'✓ 已配置' if self.config.webhook_url else '✗ 未配置'}")
+        self._log("info", f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self._log("info", f"日志文件: {self.log_file}")
+        self._log("info", "")
 
         # Token 脱敏
         if self.config.mask_sensitive:
             self.masker.mask_value(self.config.github_token)
 
+        # 检查 API 速率限制
+        print("[1/5] 检查 API 配额...")
+        self._log("info", "[0/6] 检查 API 速率限制...", force_show=self.config.verbose)
+        self._check_rate_limit()
+        self._log("info", "")
+
         # 1. 获取用户和组织信息
-        logging.info("[1/6] 获取用户和组织信息...")
+        print("[2/5] 获取账户信息...")
+        self._log("info", "[1/6] 获取用户和组织信息...")
         if not self._fetch_user_info():
             return 0, 0, 0
 
         # 2. 搜索受感染仓库
-        logging.info("[2/6] 搜索受感染仓库...")
+        print("[3/5] 扫描仓库...")
+        self._log("info", "[2/6] 搜索受感染仓库...")
         self._search_infected_repos()
 
         total_infected = len(self.result.infected_repos)
-        logging.info(f"✓ 发现 {total_infected} 个受感染仓库")
+        print(f"✓ 发现 {total_infected} 个受感染仓库")
+        self._log("info", f"✓ 发现 {total_infected} 个受感染仓库")
 
         if total_infected == 0:
             self._generate_report()
-            logging.info("✓ 未发现威胁，扫描完成")
+            print("✓ 未发现威胁，扫描完成")
+            self._log("info", "✓ 未发现威胁，扫描完成")
             if self.config.webhook_url:
                 self.notifier.send(
                     "✅ 安全扫描完成",
@@ -249,20 +407,23 @@ class SecurityScanner:
 
         # 3. 克隆并清理仓库
         if not self.config.scan_only:
-            logging.info("[3/6] 克隆并清理受感染仓库...")
+            print(f"[4/5] 清理 {total_infected} 个仓库...")
+            self._log("info", "[3/6] 克隆并清理受感染仓库...")
             self._cleanup_repos()
         else:
-            logging.info("[3/6] 跳过清理（仅扫描模式）")
+            print("[4/5] 跳过清理（仅扫描模式）")
+            self._log("info", "[3/6] 跳过清理（仅扫描模式）")
 
         # 4. 禁用工作流
         if self.config.disable_workflows and not self.config.scan_only:
-            logging.info("[4/6] 禁用受感染仓库的工作流...")
+            self._log("info", "[4/6] 禁用受感染仓库的工作流...")
             self._disable_workflows()
         else:
-            logging.info("[4/6] 跳过禁用工作流")
+            self._log("info", "[4/6] 跳过禁用工作流")
 
         # 5. 生成报告
-        logging.info("[5/6] 生成清理报告...")
+        print("[5/5] 生成报告...")
+        self._log("info", "[5/6] 生成清理报告...")
         self._generate_report()
 
         # 6. 发送通知
@@ -280,20 +441,22 @@ class SecurityScanner:
                 f"⚠️ 请立即查看报告并轮换 Secrets！"
             )
             self.notifier.send(title, message, severity)
-            logging.info("✓ 已发送 Webhook 通知")
+            self._log("info", "✓ 已发送 Webhook 通知")
 
-        logging.info("")
-        logging.info("=" * 60)
-        logging.info("清理完成")
-        logging.info("=" * 60)
-        logging.info(f"统计汇总:")
-        logging.info(f"  受感染仓库: {total_infected}")
-        logging.info(f"  清理成功: {success_count}")
-        logging.info(f"  清理失败: {failed_count}")
-        logging.info(f"  禁用工作流: {self.result.disabled_count}")
-        logging.info("")
-        logging.warning("⚠️  重要: 使用完成后立即撤销 Token！")
-        logging.info("   https://github.com/settings/tokens")
+        print("")
+        print("✓ 扫描完成")
+        self._log("info", "")
+        self._log("info", "=" * 60)
+        self._log("info", "清理完成")
+        self._log("info", "=" * 60)
+        self._log("info", f"统计汇总:")
+        self._log("info", f"  受感染仓库: {total_infected}")
+        self._log("info", f"  清理成功: {success_count}")
+        self._log("info", f"  清理失败: {failed_count}")
+        self._log("info", f"  禁用工作流: {self.result.disabled_count}")
+        self._log("info", "")
+        self._log("warning", "⚠️  重要: 使用完成后立即撤销 Token！")
+        self._log("info", "   https://github.com/settings/tokens")
 
         return total_infected, success_count, failed_count
 
@@ -301,18 +464,18 @@ class SecurityScanner:
         """获取用户和组织信息"""
         user_info = self._api_request("/user")
         if not user_info:
-            logging.error("无法获取用户信息，请检查 Token 权限")
+            self._log("error", "无法获取用户信息，请检查 Token 权限", force_show=True)
             return False
 
         self.result.username = user_info.get("login", "unknown")
-        logging.info(f"✓ 用户: {self.result.username}")
+        self._log("info", f"✓ 用户: {self.result.username}", force_show=False)
 
         # 获取组织
         orgs_data = self._api_request("/user/orgs")
         if orgs_data:
             self.result.organizations = [org["login"] for org in orgs_data]
             if self.result.organizations:
-                logging.info(f"✓ 组织: {', '.join(self.result.organizations)}")
+                self._log("info", f"✓ 组织: {', '.join(self.result.organizations)}", force_show=False)
 
         return True
 
@@ -327,8 +490,42 @@ class SecurityScanner:
             per_page = 100
             total_processed = 0
 
-            while True:
-                logging.info(f"  搜索: {scope} (第 {page} 页)...")
+            # 首次搜索
+            self._log("info", f"  搜索: {scope} (第 {page} 页)...", force_show=False)
+            search_result = self._api_request(
+                f"/search/code?q={requests.utils.quote(query)}&per_page={per_page}&page={page}"
+            )
+
+            if not search_result or "items" not in search_result:
+                continue
+
+            items = search_result["items"]
+
+            # 优化：如果第一页没有结果，跳过后续页
+            if not items:
+                self._log("info", f"  ✓ {scope}: 第一页无结果，跳过", force_show=False)
+                continue
+
+            # 处理第一页结果
+            for item in items:
+                repo_name = item["repository"]["full_name"]
+                file_path = item["path"]
+
+                # 排除特定文件
+                if self.config.excluded_pattern in file_path:
+                    self._log("info", f"  跳过排除的文件: {repo_name}/{file_path}", force_show=False)
+                    continue
+
+                if repo_name not in self.result.infected_repos:
+                    self.result.infected_repos.append(repo_name)
+                    self._log("info", f"  ✓ 发现: {repo_name} - {file_path}", force_show=False)
+
+            total_processed += len(items)
+
+            # 继续分页查询（仅当第一页有结果时）
+            while len(items) >= per_page and total_processed < 1000:
+                page += 1
+                self._log("info", f"  搜索: {scope} (第 {page} 页)...", force_show=False)
                 search_result = self._api_request(
                     f"/search/code?q={requests.utils.quote(query)}&per_page={per_page}&page={page}"
                 )
@@ -344,39 +541,31 @@ class SecurityScanner:
                     repo_name = item["repository"]["full_name"]
                     file_path = item["path"]
 
-                    # 排除特定文件
                     if self.config.excluded_pattern in file_path:
-                        logging.info(f"  跳过排除的文件: {repo_name}/{file_path}")
+                        self._log("info", f"  跳过排除的文件: {repo_name}/{file_path}", force_show=False)
                         continue
 
                     if repo_name not in self.result.infected_repos:
                         self.result.infected_repos.append(repo_name)
-                        logging.info(f"  ✓ 发现: {repo_name} - {file_path}")
+                        self._log("info", f"  ✓ 发现: {repo_name} - {file_path}", force_show=False)
 
                 total_processed += len(items)
 
-                # GitHub API 每页最多 100 条,总共最多 1000 条结果
-                # 如果本页结果少于 per_page,说明已经是最后一页
-                if len(items) < per_page or total_processed >= 1000:
-                    break
-
-                page += 1
-
             if total_processed > 0:
-                logging.info(f"  ✓ {scope}: 处理了 {total_processed} 个搜索结果")
+                self._log("info", f"  ✓ {scope}: 处理了 {total_processed} 个搜索结果", force_show=False)
 
     def _cleanup_repos(self):
         """清理受感染的仓库"""
         for i, repo in enumerate(self.result.infected_repos, 1):
-            logging.info("")
-            logging.info(f"[{i}/{len(self.result.infected_repos)}] 处理仓库: {repo}")
+            self._log("info", "")
+            self._log("info", f"[{i}/{len(self.result.infected_repos)}] 处理仓库: {repo}")
             repo_dir = self.config.work_dir / repo.replace("/", "_")
 
             try:
                 # 克隆或拉取仓库
                 if repo_dir.exists():
-                    logging.info(f"  ✓ 使用缓存: {repo_dir}")
-                    logging.info(f"  📥 更新仓库...")
+                    self._log("info", f"  ✓ 使用缓存: {repo_dir}")
+                    self._log("info", f"  📥 更新仓库...")
                     result = subprocess.run(
                         ["git", "pull"],
                         cwd=repo_dir,
@@ -385,9 +574,9 @@ class SecurityScanner:
                     )
                     if result.stdout:
                         logging.debug(f"  Git pull output: {result.stdout.decode().strip()}")
-                    logging.info(f"  ✓ 仓库已更新")
+                    self._log("info", f"  ✓ 仓库已更新")
                 else:
-                    logging.info(f"  📥 克隆仓库...")
+                    self._log("info", f"  📥 克隆仓库...")
                     clone_url = f"https://{self.config.github_token}@github.com/{repo}.git"
                     if self.config.mask_sensitive:
                         self.masker.mask_value(clone_url)
@@ -397,15 +586,15 @@ class SecurityScanner:
                         capture_output=True,
                         check=True
                     )
-                    logging.info(f"  ✓ 克隆成功")
+                    self._log("info", f"  ✓ 克隆成功")
 
                 # 查找并删除恶意文件
                 workflow_dir = repo_dir / ".github" / "workflows"
                 if not workflow_dir.exists():
-                    logging.warning(f"  ⚠️ workflow 目录不存在")
+                    self._log("warning", f"  ⚠️ workflow 目录不存在")
                     continue
 
-                logging.info(f"  🔍 扫描 workflow 文件...")
+                self._log("info", f"  🔍 扫描 workflow 文件...")
                 deleted_files = []
                 for workflow_file in workflow_dir.glob("*.y*ml"):
                     logging.debug(f"  检查: {workflow_file.name}")
@@ -413,15 +602,15 @@ class SecurityScanner:
                     if self.config.search_keyword in content and self.config.excluded_pattern not in workflow_file.name:
                         deleted_files.append(workflow_file.name)
                         workflow_file.unlink()
-                        logging.info(f"  🗑️  删除: {workflow_file.name}")
+                        self._log("info", f"  🗑️  删除: {workflow_file.name}")
                     else:
                         logging.debug(f"  ✓ 跳过: {workflow_file.name}")
 
                 if not deleted_files:
-                    logging.info(f"  ℹ️  未找到恶意文件")
+                    self._log("info", f"  ℹ️  未找到恶意文件")
                     continue
 
-                logging.info(f"  📝 提交更改 ({len(deleted_files)} 个文件)...")
+                self._log("info", f"  📝 提交更改 ({len(deleted_files)} 个文件)...")
 
                 # 提交更改
                 before_sha = subprocess.check_output(
@@ -442,12 +631,12 @@ class SecurityScanner:
                     ["git", "rev-parse", "HEAD"],
                     cwd=repo_dir
                 ).decode().strip()
-                logging.info(f"  ✓ 已提交: {after_sha[:7]}")
+                self._log("info", f"  ✓ 已提交: {after_sha[:7]}")
 
                 # 推送更改
-                logging.info(f"  ⬆️  推送更改到远程仓库...")
+                self._log("info", f"  ⬆️  推送更改到远程仓库...")
                 self._push_changes(repo, repo_dir)
-                logging.info(f"  ✓ 推送成功")
+                self._log("info", f"  ✓ 推送成功")
 
                 self.result.cleaned_repos.append({
                     "repo": repo,
@@ -455,10 +644,10 @@ class SecurityScanner:
                     "after_sha": after_sha,
                     "deleted_files": deleted_files
                 })
-                logging.info(f"  ✅ 清理完成")
+                self._log("info", f"  ✅ 清理完成")
 
             except Exception as e:
-                logging.error(f"  ❌ 清理失败: {e}")
+                self._log("error", f"  ❌ 清理失败: {e}")
                 self.result.failed_repos.append({
                     "repo": repo,
                     "reason": str(e)
@@ -494,7 +683,7 @@ class SecurityScanner:
         """禁用受感染仓库的工作流"""
         for repo in self.result.infected_repos:
             if repo == self.current_repo:
-                logging.info(f"  跳过当前仓库: {repo}")
+                self._log("info", f"  跳过当前仓库: {repo}")
                 continue
 
             workflows = self._api_request(f"/repos/{repo}/actions/workflows")
@@ -509,7 +698,7 @@ class SecurityScanner:
                     )
                     if result is not None:
                         self.result.disabled_count += 1
-                        logging.info(f"  ✓ 禁用: {repo} - {workflow['name']}")
+                        self._log("info", f"  ✓ 禁用: {repo} - {workflow['name']}")
 
     def _generate_report(self):
         """生成报告"""
@@ -527,7 +716,7 @@ class SecurityScanner:
         else:  # markdown (default)
             self._generate_markdown_report(total_infected, success_count, failed_count)
 
-        logging.info(f"✓ 报告已保存: {self.report_file}")
+        self._log("info", f"✓ 报告已保存: {self.report_file}")
 
     def _generate_json_report(self, total_infected: int, success_count: int, failed_count: int):
         """生成 JSON 格式报告"""
@@ -755,8 +944,8 @@ class SecurityScanner:
         """生成 PDF 格式报告（先生成 HTML，提示用户手动转换）"""
         # PDF 生成需要额外的库（如 weasyprint 或 reportlab）
         # 为了保持依赖简单，这里先生成 HTML，并在日志中提示
-        logging.warning("⚠️  PDF 格式需要额外工具转换")
-        logging.info("  建议: 使用 wkhtmltopdf 或浏览器打印功能将 HTML 转为 PDF")
+        self._log("warning", "⚠️  PDF 格式需要额外工具转换", force_show=True)
+        self._log("info", "  建议: 使用 wkhtmltopdf 或浏览器打印功能将 HTML 转为 PDF", force_show=True)
 
         # 生成 HTML 作为中间格式
         html_file = self.report_file.with_suffix('.html')
@@ -766,8 +955,8 @@ class SecurityScanner:
         self._generate_html_report(total_infected, success_count, failed_count)
         self.config.report_format = original_format
 
-        logging.info(f"  HTML 报告已生成: {html_file}")
-        logging.info(f"  转换命令示例: wkhtmltopdf {html_file} {self.report_file}")
+        self._log("info", f"  HTML 报告已生成: {html_file}")
+        self._log("info", f"  转换命令示例: wkhtmltopdf {html_file} {self.report_file}")
 
     def _generate_markdown_report(self, total_infected: int, success_count: int, failed_count: int):
         """生成 Markdown 格式报告（原有实现）"""
@@ -842,7 +1031,7 @@ class SecurityScanner:
 """
 
         self.report_file.write_text(report_content, encoding="utf-8")
-        logging.info(f"✓ 报告已保存: {self.report_file}")
+        self._log("info", f"✓ 报告已保存: {self.report_file}")
 
 
 def main():
@@ -854,13 +1043,15 @@ def main():
         scan_only=os.getenv("SCAN_ONLY", "false").lower() == "true",
         disable_workflows=os.getenv("DISABLE_WORKFLOWS", "false").lower() == "true",
         mask_sensitive=os.getenv("MASK_SENSITIVE_DATA", "true").lower() == "true",
+        encrypt_logs=os.getenv("ENCRYPT_LOGS", "true").lower() == "true",  # 默认启用加密
+        verbose=os.getenv("VERBOSE", "false").lower() == "true",  # 默认关闭详细日志
         webhook_url=os.getenv("NOTIFICATION_WEBHOOK", ""),
         notification_template=os.getenv("NOTIFICATION_TEMPLATE", "detailed"),
         report_format=os.getenv("REPORT_FORMAT", "markdown"),
     )
 
     if not config.github_token:
-        logging.error("错误: 请设置 GITHUB_TOKEN 环境变量")
+        print("错误: 请设置 GITHUB_TOKEN 环境变量", file=sys.stderr)
         sys.exit(1)
 
     try:

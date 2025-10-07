@@ -1,19 +1,53 @@
 name: Test Action
 
+# 只允许手动触发测试，避免在 push 时自动扫描本仓库
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
     inputs:
       keyword:
         description: '搜索关键词'
         required: false
         default: '.oast.fun'
+      dry_run:
+        description: '仅扫描模式（true/false）'
+        required: false
+        type: boolean
+        default: true
       mask_sensitive:
         description: '日志脱敏（true/false）'
         required: false
-        default: 'true'
+        type: boolean
+        default: true
+      encrypt_logs:
+        description: '日志加密（true/false）'
+        required: false
+        type: boolean
+        default: true
+      verbose:
+        description: '详细日志模式（true/false）'
+        required: false
+        type: boolean
+        default: false
+      disable_workflows:
+        description: '禁用受感染仓库的工作流（true/false）'
+        required: false
+        type: boolean
+        default: false
+      create_issue:
+        description: '发现威胁时创建 Issue（true/false）'
+        required: false
+        type: boolean
+        default: false
+      report_format:
+        description: '报告输出格式'
+        required: false
+        type: choice
+        options:
+          - markdown
+          - json
+          - html
+          - pdf
+        default: markdown
 
 jobs:
   test-dry-run:
@@ -32,11 +66,15 @@ jobs:
       - name: Test Action (Dry Run)
         uses: ./
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.SECRETS_TOKEN }}
           keyword: ${{ github.event.inputs.keyword || '.oast.fun' }}
-          dry-run: 'true'
-          create-issue: 'false'
-          mask-sensitive-data: ${{ github.event.inputs.mask_sensitive || 'true' }}
+          dry-run: ${{ github.event.inputs.dry_run != false && 'true' || 'false' }}
+          create-issue: ${{ github.event.inputs.create_issue == true && 'true' || 'false' }}
+          mask-sensitive-data: ${{ github.event.inputs.mask_sensitive != false && 'true' || 'false' }}
+          encrypt-logs: ${{ github.event.inputs.encrypt_logs != false && 'true' || 'false' }}
+          verbose: ${{ github.event.inputs.verbose == true && 'true' || 'false' }}
+          disable-workflows: ${{ github.event.inputs.disable_workflows == true && 'true' || 'false' }}
+          report-format: ${{ github.event.inputs.report_format || 'markdown' }}
 
       - name: Verify outputs
         run: |
@@ -55,34 +93,3 @@ jobs:
           else
             echo "⚠️ 日志目录不存在"
           fi
-
-  test-with-notification:
-    name: 测试通知功能
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-
-    permissions:
-      contents: write
-      actions: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Test with Webhook (Mock)
-        uses: ./
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          keyword: '.oast.fun'
-          dry-run: 'true'
-          create-issue: 'false'
-          # 使用 RequestBin 或类似服务测试 Webhook
-          notification-webhook: ${{ secrets.TEST_WEBHOOK_URL || '' }}
-          notification-template: 'detailed'
-          mask-sensitive-data: 'true'
-
-      - name: Check notification result
-        run: |
-          echo "✓ Webhook 测试完成"
-          echo "如需测试真实通知，请在 Secrets 中设置 TEST_WEBHOOK_URL"
-

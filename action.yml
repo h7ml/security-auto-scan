@@ -35,6 +35,16 @@ inputs:
     required: false
     default: 'true'
 
+  encrypt-logs:
+    description: '日志加密（加密存储详细日志 - true/false）'
+    required: false
+    default: 'true'
+
+  verbose:
+    description: '详细日志模式（输出详细日志到控制台 - true/false）'
+    required: false
+    default: 'false'
+
   notification-webhook:
     description: 'Webhook URL（支持 Slack/Teams/Discord 等）'
     required: false
@@ -91,6 +101,8 @@ runs:
         SCAN_ONLY: ${{ inputs.dry-run }}
         DISABLE_WORKFLOWS: ${{ inputs.disable-workflows }}
         MASK_SENSITIVE_DATA: ${{ inputs.mask-sensitive-data }}
+        ENCRYPT_LOGS: ${{ inputs.encrypt-logs }}
+        VERBOSE: ${{ inputs.verbose }}
         NOTIFICATION_WEBHOOK: ${{ inputs.notification-webhook }}
         NOTIFICATION_TEMPLATE: ${{ inputs.notification-template }}
         REPORT_FORMAT: ${{ inputs.report-format }}
